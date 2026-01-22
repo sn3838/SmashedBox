@@ -48,6 +48,8 @@ export interface PayoutEvent {
   winners?: { uid: string; name: string }[]; // For shared pots
 }
 
+export type PayoutLog = PayoutEvent; // <--- ADD THIS ALIAS
+
 export interface GameSettings {
   name: string;
   teamA: string;
