@@ -4,7 +4,7 @@ import React, { useMemo, useState, useEffect, Suspense } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Copy, PlusCircle, LayoutGrid, Users as UsersIcon, LogOut, DollarSign, Trophy } from "lucide-react";
+import { Copy, LayoutGrid, Users as UsersIcon, LogOut, DollarSign, Trophy } from "lucide-react";
 import Grid from "@/components/Grid";
 import GameInfo from "@/components/GameInfo";
 import GameWinnersLog from "@/components/GameWinnersLog";
@@ -17,22 +17,16 @@ import AuthModal from "@/components/AuthModal";
 import { useAuth } from "@/context/AuthContext";
 import { useGame, type GameState } from "@/context/GameContext";
 import { cn } from "@/lib/utils";
-import { EspnScoreData, useEspnScores } from "@/hooks/useEspnScores";
+import { type EspnScoreData, useEspnScores } from "@/hooks/useEspnScores";
+import { type GameAxisData } from "@/lib/game-logic";
 
 type View = "home" | "create" | "game" | "join" | "props";
 
 function SquaresApp() {
   const router = useRouter();
-  // Wrap useSearchParams in a way that is robust or accept that it might be null during SSR?
-  // Since it's a client component, it's fine.
   const searchParams = useSearchParams();
   const initialGameCode = searchParams.get("code") || "";
   const currentView = (searchParams.get("view") as View) || (initialGameCode ? "join" : "home");
-
-  // State "view" is now derived. We don't need local state for it anymore,
-  // but if we want to keep the existing logic simple, we can just use the Derived view.
-  // HOWEVER, existing components might expect view state to be immediate.
-  // We'll trust the router.
 
   const { user, logout, loading, isAdmin } = useAuth();
   const { activeGame, settings, squares, players, scores, claimSquare, unclaimSquare, togglePaid, deletePlayer, updateScores, leaveGame, resetGame, scrambleGridDigits, resetGridDigits, updateSettings, getUserGames, joinGame, logPayout, payoutHistory, deleteGame } = useGame();
@@ -42,6 +36,28 @@ function SquaresApp() {
   const [hasCheckedGames, setHasCheckedGames] = useState(false);
   const [copiedUid, setCopiedUid] = useState(false);
   const [selectedCell, setSelectedCell] = useState<{ row: number; col: number } | null>(null);
+
+  // --- NEW: QUARTERLY ROTATION STATE ---
+  type QuarterKey = 'q1' | 'q2' | 'q3' | 'final';
+  const [viewQuarter, setViewQuarter] = useState<QuarterKey>('q1');
+
+  // Sync view with live game status automatically
+  const matchedLiveGame = useMemo(() => {
+    if (!activeGame || liveGames.length === 0) return null;
+    if (settings.espnGameId) {
+      return liveGames.find(g => g.id === settings.espnGameId);
+    }
+    return null;
+  }, [liveGames, activeGame, settings.espnGameId]);
+
+  useEffect(() => {
+    if (matchedLiveGame?.period) {
+      if (matchedLiveGame.period === 1) setViewQuarter('q1');
+      else if (matchedLiveGame.period === 2) setViewQuarter('q2');
+      else if (matchedLiveGame.period === 3) setViewQuarter('q3');
+      else if (matchedLiveGame.period >= 4) setViewQuarter('final');
+    }
+  }, [matchedLiveGame?.period]);
 
   const sortedMyGames = useMemo(() => {
     const list = myGames.map(game => {
@@ -67,10 +83,7 @@ function SquaresApp() {
   }, [players, settings.pricePerSquare]);
 
   const payouts = useMemo(() => {
-    // Default distribution: 20% Q1, 20% Q2, 20% Q3, 40% Final
     const distribution = [0.20, 0.20, 0.20, 0.40];
-    
-    // If we have custom payout settings, try to respect the labels, otherwise default
     const defaults = ["Q1 Winner", "Q2 Winner", "Q3 Winner", "Final Winner"];
     
     return distribution.map((pct, i) => {
@@ -82,12 +95,10 @@ function SquaresApp() {
     });
   }, [totalPot, settings.payouts]);
 
-  // Helper to change view
   const setView = (v: View) => {
     router.push(`/?view=${v}`);
   };
 
-  // Auto-redirect to game if user belongs to exactly one
   useEffect(() => {
     if (!user || hasCheckedGames) return;
 
@@ -100,9 +111,7 @@ function SquaresApp() {
       setMyGames(games);
       setHasCheckedGames(true);
 
-      // Only auto-join if we are NOT already in a game (activeGame null) and haven't selected one
       if (games.length === 1 && !activeGame) {
-        // Pass user.uid to joinGame to bypass password if we are a participant
         await joinGame(games[0].id, undefined, user.uid);
         router.push("/?view=game");
       }
@@ -146,36 +155,43 @@ function SquaresApp() {
     }
   };
 
+  // --- NEW: DETERMINE ACTIVE NUMBERS ---
+  const currentAxis = useMemo(() => {
+    // Cast settings to any because axisValues might not be typed in your context yet
+    const axisData = (settings as any).axisValues as GameAxisData | undefined;
+    
+    if (axisData && axisData[viewQuarter]) {
+      return axisData[viewQuarter];
+    }
+    // Fallback logic
+    return { rows: settings.rows, cols: settings.cols };
+  }, [settings, viewQuarter]);
+
   const handleManualPayout = async (teamA: number, teamB: number) => {
     if (!canManage) return;
 
-    // 1. Update scores globally if different to ensure everyone sees the winning score
     if (teamA !== scores.teamA || teamB !== scores.teamB) {
         await updateScores(teamA, teamB);
     }
 
-    // 2. Validate Grid
+    // Validate Grid using CURRENT AXIS (allows payouts on past quarters if viewed)
     const rowDigit = ((teamA % 10) + 10) % 10;
     const colDigit = ((teamB % 10) + 10) % 10;
-    const rowIndex = settings.rows.indexOf(rowDigit);
-    const colIndex = settings.cols.indexOf(colDigit);
+    const rowIndex = currentAxis.rows.indexOf(rowDigit);
+    const colIndex = currentAxis.cols.indexOf(colDigit);
 
     if (rowIndex < 0 || colIndex < 0) {
         alert("Cannot determine winner: Grid digits are not set or grid is invalid.");
         return;
     }
 
-    // 3. Identify Winner
     const key = `${rowIndex}-${colIndex}`;
     const claims = squares[key] || [];
     
-    // 4. Determine Payout Details
-    // Use the next available label from our standard set, or fallback
     const standardLabels = ["Q1 Winner", "Q2 Winner", "Q3 Winner", "Final Winner"];
     const nextLabelIndex = Math.min(payoutHistory.length, standardLabels.length - 1);
     const label = standardLabels[nextLabelIndex];
     
-    // Amount from our calculated `payouts` memo
     const payoutInfo = payouts.find(p => p.label === label) || payouts[payouts.length - 1];
     const amount = payoutInfo ? payoutInfo.amount : 0;
 
@@ -210,39 +226,20 @@ function SquaresApp() {
     });
   };
 
+  // --- UPDATED: WINNING CELL LOGIC ---
   const winningCell = useMemo(() => {
     const rowDigit = ((scores.teamA % 10) + 10) % 10;
     const colDigit = ((scores.teamB % 10) + 10) % 10;
-    // json stringify to prevent ref changes
-    const rowsStr = JSON.stringify(settings.rows);
-    const colsStr = JSON.stringify(settings.cols);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    const rows = JSON.parse(rowsStr) as number[];
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    const cols = JSON.parse(colsStr) as number[];
 
-    const rowIndex = rows.indexOf(rowDigit);
-    const colIndex = cols.indexOf(colDigit);
+    // Use currentAxis instead of settings.rows
+    const rowIndex = currentAxis.rows.indexOf(rowDigit);
+    const colIndex = currentAxis.cols.indexOf(colDigit);
+
     if (rowIndex < 0 || colIndex < 0) return null;
     return { row: rowIndex, col: colIndex };
-  }, [scores.teamA, scores.teamB, settings.rows, settings.cols]);
+  }, [scores.teamA, scores.teamB, currentAxis]);
 
-  // Find the matching live game
-  const matchedLiveGame = useMemo(() => {
-    if (!activeGame || liveGames.length === 0) return null;
-    
-    // If we have an explicit ESPN Game ID linked, ONLY sync with that game.
-    // This allows manual overrides (by clearing the ID) to work without interference.
-    if (settings.espnGameId) {
-      return liveGames.find(g => g.id === settings.espnGameId);
-    }
-    
-    // If no explicit ID is linked, we DO NOT fuzzy match anymore to prevent accidental overwrites
-    // when admin wants manual control.
-    return null;
-  }, [liveGames, activeGame, settings.espnGameId]);
 
-  // Sync with Live ESPN Data
   useEffect(() => {
     if (!matchedLiveGame) return;
 
@@ -256,7 +253,6 @@ function SquaresApp() {
     const teamAName = settings.teamA.toLowerCase();
     const teamBName = settings.teamB.toLowerCase();
 
-    // Heuristics to map API Home/Away to Context TeamA/TeamB
     let newAScore = scores.teamA;
     let newBScore = scores.teamB;
     let mismatched = false;
@@ -295,11 +291,9 @@ function SquaresApp() {
     let logoA = undefined;
     let logoB = undefined;
 
-    // Try to match A
     if (teamAName.includes(homeName) || homeName.includes(teamAName)) logoA = home.logo;
     else if (teamAName.includes(awayName) || awayName.includes(teamAName)) logoA = away.logo;
 
-    // Try to match B
     if (teamBName.includes(homeName) || homeName.includes(teamBName)) logoB = home.logo;
     else if (teamBName.includes(awayName) || awayName.includes(teamBName)) logoB = away.logo;
 
@@ -324,7 +318,7 @@ function SquaresApp() {
 
     const { period, clock, status, statusDetail } = matchedLiveGame;
     const isSoccer = leagueKey.includes("soccer") || leagueKey.includes("ucl") || leagueKey.includes("epl") || leagueKey.includes("mls") || leagueKey.includes("uefa");
-    // Helper to parse clock "MM:SS" -> seconds
+    
     const parseClock = (str: string) => {
       const parts = str.split(":").map(Number);
       if (parts.length === 2) return parts[0] * 60 + parts[1];
@@ -332,10 +326,8 @@ function SquaresApp() {
     };
     const secondsLeft = parseClock(clock);
     const isQuarterEnd = secondsLeft === 0 || status === "post";
-    // For NBA (12 min quarters), mid-point is around 6:00 (360s)
     const isQuarterMid = secondsLeft <= 360 && secondsLeft > 0;
 
-    // Determine current trigger
     let triggerId = "";
     let triggerLabel = "";
     
@@ -350,7 +342,6 @@ function SquaresApp() {
         triggerLabel = "Final Winner";
       }
     } else {
-      // Q1..Q4 logic
       if (period >= 1 && period <= 4) {
         if (effectivePayoutFrequency === "NBA_Frequent" && isQuarterMid) {
           triggerId = `Q${period}_MID`;
@@ -364,25 +355,19 @@ function SquaresApp() {
     }
     
     if (!triggerId) return;
-
-    // Check if already logged
     if (payoutHistory.some(p => p.id === triggerId)) return;
 
-    // Calculate winner
     const rowDigit = ((scores.teamA % 10) + 10) % 10;
     const colDigit = ((scores.teamB % 10) + 10) % 10;
-    const rowIndex = settings.rows.indexOf(rowDigit);
-    const colIndex = settings.cols.indexOf(colDigit);
+    const rowIndex = currentAxis.rows.indexOf(rowDigit);
+    const colIndex = currentAxis.cols.indexOf(colDigit);
 
-    if (rowIndex < 0 || colIndex < 0) return; // Grid probably scrambled? or not set up?
+    if (rowIndex < 0 || colIndex < 0) return;
 
     const key = `${rowIndex}-${colIndex}`;
     const claims = squares[key] || [];
     
-    // If multiple people claimed the square (rare but possible in some variants), just pick first or all? 
-    // Usually squares are unique.
     if (claims.length === 0) {
-        // Log "No Winner" -> Carry over? For now just log "Rollover"
          void logPayout({
           id: triggerId,
           period,
@@ -398,24 +383,11 @@ function SquaresApp() {
     }
     
     const payoutAmount = Math.floor(totalPot * (triggerLabel.includes("Final") ? 0.4 : 0.2)); 
-    // Note: This payout calculation is static based on 20/20/20/40. If frequent, we might want to split it.
-    // If "Frequent", we have 8 payouts (Q1 mid, Q1 end, ...).
-    // The prompt didn't specify amount logic for frequent.
-    // I'll assume for "Frequent", we split the Quarter pot? Or just log the event.
-    // Let's assume standard distribution for now, maybe split in half if "Frequent"?
-    // If Frequent, we have 8 events. 100% / 8 = 12.5% each?
-    // Let's stick to the prompt: "trigger a 'Winner' notification and log a payout".
-    // I will dynamically calculate amount: 
-    // Standard: 4 events. 20/20/20/40.
-    // Frequent: 8 events. Let's do 10/10/10/10/10/10/10/30? Or 12.5 flat.
-    // I'll use a simple heuristic:
     let actualAmount = payoutAmount;
     if (effectivePayoutFrequency === "NBA_Frequent") {
-        // Split the quarter's allocation in half?
         actualAmount = Math.floor(payoutAmount / 2);
     }
     
-    // Multiple users can share the winning square. Include all names in the notification.
     const winners = claims.map((c) => ({ uid: c.uid, name: c.name }));
     const primaryWinner = winners[0];
     const winnerNamesCombined = winners.map((w) => w.name).join(", ");
@@ -431,7 +403,6 @@ function SquaresApp() {
       timestamp: Date.now(),
       teamAScore: scores.teamA,
       teamBScore: scores.teamB,
-      // Add metadata for global history
       gameId: activeGame?.id,
       gameName: activeGame?.settings?.name,
       teamA: activeGame?.settings?.teamA,
@@ -439,20 +410,12 @@ function SquaresApp() {
       eventDate: activeGame?.settings?.eventDate
     });
 
-  }, [matchedLiveGame, isHost, settings.payoutFrequency, scores, squares, settings.rows, settings.cols, payoutHistory, totalPot, logPayout, activeGame]);
+  }, [matchedLiveGame, isHost, settings.payoutFrequency, scores, squares, currentAxis, payoutHistory, totalPot, logPayout, activeGame]);
   
   // Show Payout Notification (Toast)
   useEffect(() => {
-    // Determine the most recent payout
     if (payoutHistory.length === 0) return;
-    const latest = payoutHistory[0]; // Sorted desc in context
-    
-    // Check if valid timestamp (fresh within last 10 seconds? or just show it if we haven't seen it?)
-    // This is a simple view component, maybe we don't need a toast, just a section.
-    // Prompt said "trigger a 'Winner' notification".
-    // I'll use browser Alert for now or valid UI if I can fit it.
-    // A persistent "Last Payout" banner is better.
-    
+    const latest = payoutHistory[0]; 
   }, [payoutHistory]);
 
   if (loading) return null;
@@ -462,16 +425,13 @@ function SquaresApp() {
     setSelectedCell({ row, col });
     if (!user) return;
     
-    // Check if user has already claimed this square
     const key = `${row}-${col}`;
     const existing = squares[key] || [];
     const userClaim = existing.find(c => c.uid === user.uid);
     
     if (userClaim) {
-       // Ask if they want to unclaim? Or just check if allowed to unclaim.
-       // We'll trust unclaimSquare to check lock status
        if (confirm("You already own this square. Do you want to remove your claim?")) {
-          void unclaimSquare(row, col, user.uid);
+         void unclaimSquare(row, col, user.uid);
        }
        return;
     }
@@ -489,7 +449,6 @@ function SquaresApp() {
       setCopiedUid(true);
       window.setTimeout(() => setCopiedUid(false), 1500);
     } catch {
-      // Clipboard may be blocked by browser permissions.
       alert("Could not copy UID. Please copy from Firebase Console.");
     }
   };
@@ -499,16 +458,11 @@ function SquaresApp() {
     const cost = count * settings.pricePerSquare;
     if (!confirm(`Quick pick ${count} squares for $${cost}?`)) return;
 
-    // 1. Identify all available squares
     const availableCells: { row: number; col: number }[] = [];
     for (let r = 0; r < settings.rows.length; r++) {
       for (let c = 0; c < settings.cols.length; c++) {
         const key = `${r}-${c}`;
         const claims = squares[key] || [];
-        // Assuming square limit is 10 per cell? Or exclusive?
-        // Usually squares are 1 per person unless "100 squares" grid. 
-        // Code in context: `if (existingClaims.length >= 10) return;`
-        // Code in context: `if (existingClaims.some((c) => c.uid === player.id)) return;`
         
         const myClaim = claims.find(cl => cl.uid === user.uid);
         if (claims.length < 10 && !myClaim) {
@@ -522,18 +476,13 @@ function SquaresApp() {
       return;
     }
 
-    // 2. Shuffle (Fisher-Yates)
     for (let i = availableCells.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [availableCells[i], availableCells[j]] = [availableCells[j], availableCells[i]];
     }
 
-    // 3. Pick first N
     const picks = availableCells.slice(0, count);
 
-    // 4. Claim them
-    // We execute sequentially to avoid overwhelming browser/connection if count is high, 
-    // or we can Promise.all. Promise.all is better for speed.
     try {
         await Promise.all(picks.map(p => 
             claimSquare(p.row, p.col, { id: user.uid, name: user.displayName || "Anonymous" })
@@ -735,7 +684,7 @@ function SquaresApp() {
                            onClick={() => setView("game")} 
                            className="text-sm font-bold text-slate-500 hover:text-slate-900 dark:hover:text-white flex items-center gap-2 transition-colors pl-2"
                          >
-                            ← Back to Grid
+                           ← Back to Grid
                          </button>
                          <div className="text-xs font-black text-slate-400 uppercase tracking-widest bg-slate-100 dark:bg-slate-800 px-3 py-1 rounded-full">
                             {settings.teamA} vs {settings.teamB}
@@ -821,33 +770,52 @@ function SquaresApp() {
                   {payoutHistory.length > 0 && (
                     <div className="mb-2 bg-gradient-to-r from-yellow-500/10 to-amber-500/10 border border-amber-500/30 p-3 rounded-xl flex items-center justify-between backdrop-blur-sm transition-all">
                       <div className="flex items-center gap-3">
-                         <div className="bg-amber-500 p-2 rounded-lg text-white shadow-lg shadow-amber-500/20">
+                          <div className="bg-amber-500 p-2 rounded-lg text-white shadow-lg shadow-amber-500/20">
                            <Trophy className="w-5 h-5" />
-                         </div>
-                         <div>
+                          </div>
+                          <div>
                            <div className="text-[10px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-widest leading-none mb-1">
-                              Latest Winner: {payoutHistory[0].label}
+                             Latest Winner: {payoutHistory[0].label}
                            </div>
                            <div className="font-black text-slate-900 dark:text-white text-base leading-none">
-                              {payoutHistory[0].winnerName}
+                             {payoutHistory[0].winnerName}
                            </div>
-                         </div>
+                          </div>
                       </div>
                       <div className="text-right">
-                         <div className="text-xl font-black text-amber-600 dark:text-amber-400">${payoutHistory[0].amount}</div>
-                         <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">
+                          <div className="text-xl font-black text-amber-600 dark:text-amber-400">${payoutHistory[0].amount}</div>
+                          <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">
                            Score: {payoutHistory[0].teamAScore}-{payoutHistory[0].teamBScore}
-                         </div>
+                          </div>
                       </div>
                     </div>
                   )}
 
                   <div className="w-full relative rounded-2xl ring-1 ring-slate-200 dark:ring-white/10 shadow-2xl bg-white/50 dark:bg-slate-900/50 backdrop-blur-md">
+                      
+                      {/* --- NEW: QUARTER SELECTOR --- */}
+                      <div className="flex p-2 gap-2 border-b border-slate-200 dark:border-white/5 overflow-x-auto">
+                        {(['q1', 'q2', 'q3', 'final'] as const).map((q) => (
+                          <button
+                            key={q}
+                            onClick={() => setViewQuarter(q)}
+                            className={cn(
+                              "flex-1 py-2 px-4 text-[10px] md:text-xs font-black uppercase tracking-widest rounded-lg transition-all whitespace-nowrap",
+                              viewQuarter === q 
+                                ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/30" 
+                                : "bg-slate-100 dark:bg-slate-800 text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+                            )}
+                          >
+                            {q === 'final' ? 'Final' : q.toUpperCase()}
+                          </button>
+                        ))}
+                      </div>
+
                       {/* Grid Area - Natural Height */}
                       <div className="w-full p-0">
                         <Grid 
-                          rows={settings.rows} 
-                          cols={settings.cols} 
+                          rows={currentAxis.rows} 
+                          cols={currentAxis.cols} 
                           squares={squares}
                           winningCell={winningCell}
                           selectedCell={selectedCell}
@@ -859,14 +827,15 @@ function SquaresApp() {
                           isScrambled={settings.isScrambled}
                         />
                       </div>
+                  </div>
 
                       {/* Selected/Highlighted Square Details - Bridge the Gap */}
                       <SquareDetails 
                         cell={selectedCell || winningCell} 
                         squares={squares} 
                         settings={{
-                          rows: settings.rows,
-                          cols: settings.cols,
+                          rows: currentAxis.rows, // Using currentAxis so details match view
+                          cols: currentAxis.cols, // Using currentAxis so details match view
                           teamA: settings.teamA,
                           teamB: settings.teamB,
                           isScrambled: settings.isScrambled ?? false
@@ -922,7 +891,7 @@ function SquaresApp() {
                 {/* Sidebar - Game Info & Players */}
                  <div className="w-full lg:w-[480px] lg:shrink-0 flex flex-col gap-3 order-2">
                   <div>
-                     <GameInfo 
+                      <GameInfo 
                         gameId={activeGame.id}
                         gameName={settings.name}
                         host={activeGame.hostName}
